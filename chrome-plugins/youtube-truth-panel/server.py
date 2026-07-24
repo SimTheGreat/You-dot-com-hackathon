@@ -47,11 +47,19 @@ FACTCHECK_PROMPT = (
     "You are a fact checker for claims spoken in an online video. Fact-check "
     "the statement below. It comes from an auto-generated transcript, so it may "
     "be missing punctuation or contain small transcription errors — judge the "
-    "substance, not the wording. Your response MUST begin with exactly one line "
-    "of the form 'VERDICT: X' where X is one of TRUE, FALSE, MISLEADING, or "
-    "UNVERIFIED. On the next line give one concise sentence (max 35 words) "
-    "explaining the verdict. Base the verdict only on reliable sources. Use "
-    "UNVERIFIED when the statement is opinion, prediction, or not checkable.\n"
+    "substance, not the wording. Base the verdict only on reliable sources. Use "
+    "UNVERIFIED when the statement is opinion, prediction, or not checkable.\n\n"
+    "Answer in exactly two lines and nothing else:\n"
+    "Line 1: 'VERDICT: X' where X is one of TRUE, FALSE, MISLEADING, UNVERIFIED.\n"
+    "Line 2: one plain-English sentence of at most 30 words explaining why.\n\n"
+    "Formatting rules for line 2, follow them strictly:\n"
+    "- Plain prose only. No markdown, no headings, no '#' characters, no bullet "
+    "points, no bold or italics, no quotes around the sentence.\n"
+    "- No citation markers of any kind, such as [1] or [[1, 2, 3]].\n"
+    "- Do NOT list, name, link or describe your sources — they are displayed "
+    "separately. Never write a 'Sources' section.\n"
+    "- Lead with the substance (the correct fact or figure), not with phrases "
+    "like 'The claim is' or 'According to sources'.\n\n"
     "{context}"
     'Statement: "{claim}"'
 )
@@ -205,6 +213,58 @@ def extract_claims(transcript: str, title: str, limit: int) -> list:
 # ------------------------------------------------------------------- parsing
 
 
+# Where a research answer stops explaining and starts listing sources.
+_SOURCE_SECTION = re.compile(
+    r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*)?\s*(?:sources?|references?|citations?|"
+    r"key excerpts?|url)\s*:?\s*(?:\*\*)?\s*$"
+)
+# The first per-source entry, e.g. "### 1. Apollo 11 | The Planetary Society"
+_SOURCE_ENTRY = re.compile(r"(?im)^\s*(?:#{1,6}\s+\d+\.|\*\*URL:\*\*|\*\*Key Excerpts?:\*\*|>\s)")
+
+
+def _clean_explanation(raw: str, limit: int = 300) -> str:
+    """Turn a research answer into one clean, human sentence.
+
+    The Research API answers in markdown with citation markers and a trailing
+    source dump. The panel renders sources itself, so strip all of that and
+    keep only the prose.
+    """
+    text = raw or ""
+
+    # 1. Drop any trailing sources / references / excerpt section.
+    for pattern in (_SOURCE_SECTION, _SOURCE_ENTRY):
+        m = pattern.search(text)
+        if m:
+            text = text[: m.start()]
+
+    # 2. Remove citation markers: [[1, 2, 3]], [1], [1,2], [^3].
+    text = re.sub(r"\s*\[\[[^\]]*\]\]", "", text)
+    text = re.sub(r"\s*\[\^?\d+(?:\s*,\s*\d+)*\]", "", text)
+
+    # 3. Flatten markdown: links to their label, then drop the decoration.
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-*•+]\s+", "", text)
+    text = re.sub(r"(?m)^\s*>\s?", "", text)
+    text = text.replace("**", "").replace("__", "").replace("`", "").replace("*", "")
+    text = " ".join(text.split())
+
+    # 4. Keep it to a couple of sentences, cut on a sentence boundary.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    out = ""
+    for sentence in sentences[:2]:
+        candidate = (out + " " + sentence).strip()
+        if out and len(candidate) > limit:
+            break
+        out = candidate
+    if not out:
+        out = text
+    if len(out) > limit:
+        trimmed = out[:limit].rsplit(" ", 1)[0]
+        out = trimmed.rstrip(",;:") + "…"
+    return out.strip()
+
+
 def _parse_verdict(content: str):
     """Pull the leading 'VERDICT: X' line out of the model's answer."""
     verdict = "UNVERIFIED"
@@ -224,12 +284,7 @@ def _parse_verdict(content: str):
             rest = content.split(line, 1)[-1].strip()
             explanation = rest or explanation
             break
-    explanation = " ".join(explanation.split())
-    explanation = re.sub(r"\s*\[\d+\]", "", explanation)
-    explanation = explanation.lstrip("*#>_- ").strip()
-    if len(explanation) > 400:
-        explanation = explanation[:397] + "..."
-    return verdict, explanation
+    return verdict, _clean_explanation(explanation)
 
 
 def _parse_jsonrpc(raw: str) -> dict:

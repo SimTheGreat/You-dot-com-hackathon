@@ -93,7 +93,18 @@ Two You.com integrations, switchable in the panel:
   tool. Same engine over the Model Context Protocol, `Authorization: Bearer` auth.
 
 Repeated claims are cached in the backend, so re-scanning a video is free —
-cached cards are tagged `cached` and cost nothing.
+cached cards are tagged `cached` and cost nothing. The cache lives in memory,
+so restarting the backend clears it.
+
+### Keeping the explanation readable
+
+The Research API answers in markdown: citation markers like `[[1, 2, 3]]`, a
+`## Sources` section and `**Key Excerpts:**` blocks. None of that belongs in a
+one-line verdict, so the prompt forbids it *and* `_clean_explanation()` strips
+it anyway — cutting everything from the first sources heading, removing
+citation markers, flattening links to their label, dropping heading/bullet/bold
+syntax and trimming to at most two sentences on a sentence boundary. Sources
+are rendered separately as links, so nothing is lost.
 
 ## How claims are found
 
