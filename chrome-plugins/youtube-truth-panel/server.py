@@ -14,6 +14,7 @@ Usage:
 
 Endpoints:
     GET  /health         -> {"ok": true, "has_key": bool}
+    GET  /api/balance    -> remaining You.com credits + calls made this run
     POST /api/factcheck  -> {claim, mode, context} -> verdict + sources
     POST /api/extract    -> {transcript, title, limit} -> check-worthy claims
 """
@@ -32,8 +33,8 @@ API_KEY = os.environ.get("YDC_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", "8765"))
 
 RESEARCH_URL = "https://api.you.com/v1/research"
-SEARCH_URL = "https://ydc-index.io/v1/search"
 MCP_URL = "https://api.you.com/mcp"
+BALANCE_URL = "https://api.you.com/v1/billing/account_balance"
 
 # api.you.com sits behind Cloudflare, which 403s the default Python-urllib
 # User-Agent (error 1010). Present a normal browser UA on every outbound call.
@@ -66,6 +67,8 @@ EXTRACT_PROMPT = (
 
 _cache = {}
 _cache_lock = threading.Lock()
+# Calls actually billed this run, so the panel can show spend alongside balance.
+_usage = {"calls": 0, "cached": 0}
 
 
 # --------------------------------------------------------------- You.com calls
@@ -162,35 +165,20 @@ def call_mcp(claim: str, context: str = "") -> dict:
     }
 
 
-def call_search(claim: str, context: str = "") -> dict:
-    """Fast evidence via the You.com Web Search API (no synthesized verdict)."""
-    qs = urllib.parse.urlencode({"query": claim[:400], "count": 5})
+def call_balance() -> dict:
+    """Remaining API credits — GET /v1/billing/account_balance (cents)."""
     req = urllib.request.Request(
-        f"{SEARCH_URL}?{qs}",
-        headers={"X-API-Key": API_KEY, "User-Agent": USER_AGENT},
+        BALANCE_URL,
+        headers={"X-API-Key": API_KEY, "Accept": "application/json", "User-Agent": USER_AGENT},
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
-    # Search API shape: {"results": {"web": [...]}}; fall back to older shapes.
-    block = data.get("results", data)
-    results = block.get("web", []) if isinstance(block, dict) else []
-    if not results:
-        results = data.get("web", []) or []
-
-    snippets, sources = [], []
-    for r in results[:5]:
-        sources.append({"url": r.get("url", ""), "title": r.get("title", "") or r.get("url", "")})
-        snips = r.get("snippets") or ([r["description"]] if r.get("description") else [])
-        snippets.extend(snips[:1])
-    return {
-        "mode": "search",
-        "verdict": "UNVERIFIED",
-        "explanation": " ".join(snippets[:2])[:280] or "See sources below.",
-        "content": "\n".join(f"- {s}" for s in snippets),
-        "sources": sources,
-    }
+    attrs = ((data.get("data") or {}).get("attributes") or {})
+    cents = attrs.get("balance")
+    usd = round(cents / 100.0, 2) if isinstance(cents, (int, float)) else None
+    return {"balance_cents": cents, "balance_usd": usd}
 
 
 def extract_claims(transcript: str, title: str, limit: int) -> list:
@@ -343,6 +331,19 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
             return self._send_json(200, {"ok": True, "has_key": bool(API_KEY)})
+        if path == "/api/balance":
+            if not API_KEY:
+                return self._send_json(500, {"error": "YDC_API_KEY is not set on the server."})
+            try:
+                result = call_balance()
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:300]
+                return self._send_json(502, {"error": f"balance API error {e.code}", "detail": detail})
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)})
+            with _cache_lock:
+                result["session"] = dict(_usage)
+            return self._send_json(200, result)
         return self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -380,14 +381,17 @@ class Handler(BaseHTTPRequestHandler):
         with _cache_lock:
             hit = _cache.get(key)
         if hit:
+            with _cache_lock:
+                _usage["cached"] += 1
             return self._send_json(200, dict(hit, cached=True))
 
         context = _context_line(payload.get("context"))
-        dispatch = {"search": call_search, "mcp": call_mcp, "research": call_research}
+        dispatch = {"mcp": call_mcp, "research": call_research}
         result = dispatch.get(mode, call_research)(claim, context)
         result["claim"] = claim
         with _cache_lock:
             _cache[key] = result
+            _usage["calls"] += 1
         return self._send_json(200, result)
 
     def _extract(self, payload):
@@ -396,6 +400,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "missing 'transcript'"})
         limit = max(1, min(int(payload.get("limit") or 8), 20))
         claims = extract_claims(transcript, payload.get("title") or "", limit)
+        with _cache_lock:
+            _usage["calls"] += 1
         return self._send_json(200, {"claims": claims})
 
     def log_message(self, fmt, *args):
