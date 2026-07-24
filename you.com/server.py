@@ -22,6 +22,26 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Load environment variables from .env if present
+def _load_env():
+    env_path = os.path.join(HERE, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        os.environ[k] = v
+        except Exception as e:
+            sys.stderr.write(f"Error loading .env file: {e}\n")
+
+_load_env()
 API_KEY = os.environ.get("YDC_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -40,12 +60,103 @@ USER_AGENT = (
 # render a coloured badge, followed by a short human explanation.
 FACTCHECK_PROMPT = (
     "You are a real-time fact checker for a live podcast. Fact-check the "
-    "following spoken statement. Your response MUST begin with exactly one "
-    "line of the form 'VERDICT: X' where X is one of TRUE, FALSE, MISLEADING, "
-    "or UNVERIFIED. On the next line give one concise sentence (max 30 words) "
-    "explaining the verdict. Base the verdict only on reliable sources.\n\n"
+    "following spoken statement using live web search evidence.\n\n"
+    "EVALUATION MATRIX & TRUST HIERARCHY (SoT Architecture):\n"
+    "1. Level 0 (HIGHEST PRIORITY): Institutional, academic (.edu, .gov), peer-reviewed science (PubMed, JSTOR), and primary document files (.pdf).\n"
+    "2. Level 1 (HIGH TRUST): Major journalism & wire services (Reuters, AP, BBC, WSJ, Pew Research).\n"
+    "3. Level 2 (MODERATE TRUST): Tech/business media (TechCrunch, Forbes, Wired).\n"
+    "4. Level 3/4 (LOW TRUST): Social media, forums (Reddit, X), tabloids, personal blogs.\n\n"
+    "CRITICAL RULE: Prioritize Level 0 (.edu, .gov, document files) and Level 1 sources above all else. If Level 0/1 sources refute a claim, their verdict OVERRIDES lower-level sources.\n\n"
+    "Your response MUST begin with exactly one line of the form:\n"
+    "VERDICT: X\n"
+    "where X is one of TRUE, FALSE, MISLEADING, or UNVERIFIED.\n"
+    "On the next line give one concise sentence (max 30 words) explaining the verdict, highlighting any .edu, .gov, or file evidence if available.\n\n"
     'Statement: "{claim}"'
 )
+
+
+def _classify_source(url: str) -> dict:
+    """Classify URL according to SoT_Markdown.md trust hierarchy."""
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(url.lower())
+    domain = parsed.netloc
+    path = parsed.path
+
+    # Level 0: .edu, .gov, .mil, .int, academic databases, PDF/document files
+    is_edu = domain.endswith(".edu") or ".edu." in domain
+    is_gov = domain.endswith(".gov") or ".gov." in domain or domain.endswith(".mil") or domain.endswith(".int")
+    is_file = any(path.endswith(ext) for ext in [".pdf", ".doc", ".docx", ".csv", ".xls", ".xlsx", ".txt", ".xml"])
+    level0_domains = (
+        "ncbi.nlm.nih.gov", "pubmed", "jstor.org", "sciencedirect.com", "arxiv.org",
+        "ieee.org", "nature.com", "sciencemag.org", "who.int", "cdc.gov", "nasa.gov",
+        "nih.gov", "noaa.gov", "stanford.edu", "mit.edu", "harvard.edu", "berkeley.edu"
+    )
+    is_level0_domain = any(d in domain for d in level0_domains)
+
+    if is_edu or is_gov or is_file or is_level0_domain:
+        if is_edu:
+            badge = "🎓 .edu Academic"
+            label = "Level 0: .edu Academic"
+        elif is_file:
+            badge = "📄 Document File"
+            label = "Level 0: Primary File"
+        elif is_gov:
+            badge = "🏛️ .gov Institutional"
+            label = "Level 0: .gov Institutional"
+        else:
+            badge = "🔬 Peer-Reviewed Science"
+            label = "Level 0: Academic & Scientific"
+        return {"level": 0, "label": label, "badge": badge, "is_high_trust": True}
+
+    # Level 1: Wire services & major reputable news
+    level1_domains = (
+        "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "wsj.com",
+        "bloomberg.com", "pewresearch.org", "ft.com", "economist.com",
+        "npr.org", "pbs.org", "worldbank.org", "oecd.org", "bls.gov"
+    )
+    if any(d in domain for d in level1_domains):
+        return {"level": 1, "label": "Level 1: Major News & Wire", "badge": "📰 Major Wire / News", "is_high_trust": True}
+
+    # Level 3: Social & User-Generated Content
+    level3_domains = (
+        "reddit.com", "medium.com", "twitter.com", "x.com", "substack.com",
+        "linkedin.com", "quora.com", "tiktok.com", "youtube.com", "facebook.com"
+    )
+    if any(d in domain for d in level3_domains):
+        return {"level": 3, "label": "Level 3: User-Generated / Social", "badge": "💬 User-Generated", "is_high_trust": False}
+
+    # Level 4: Tabloid / Clickbait / High Bias
+    level4_domains = ("dailymail.co.uk", "thesun.co.uk", "nationalenquirer.com")
+    if any(d in domain for d in level4_domains):
+        return {"level": 4, "label": "Level 4: Low Reliability", "badge": "⚠️ Low Reliability", "is_high_trust": False}
+
+    # Default: Level 2 Secondary Media & Tech Publications
+    return {"level": 2, "label": "Level 2: Secondary Media", "badge": "🌐 Web Media", "is_high_trust": False}
+
+
+def _process_sources(raw_sources: list) -> list:
+    """Enrich and prioritize sources according to SoT_Markdown.md (Level 0 .edu & files first)."""
+    enriched = []
+    seen = set()
+    for s in raw_sources:
+        url = s.get("url", "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        title = s.get("title", "") or url
+        cls = _classify_source(url)
+        enriched.append({
+            "url": url,
+            "title": title,
+            "level": cls["level"],
+            "label": cls["label"],
+            "badge": cls["badge"],
+            "is_high_trust": cls["is_high_trust"],
+        })
+    # Sort by trust level (Level 0 is highest authority)
+    enriched.sort(key=lambda x: x["level"])
+    return enriched
 
 
 def call_research(claim: str) -> dict:
@@ -73,28 +184,23 @@ def call_research(claim: str) -> dict:
     content = output.get("content", "") or ""
     sources = output.get("sources", []) or []
     verdict, explanation = _parse_verdict(content)
+    raw_sources = [
+        {"url": s.get("url", ""), "title": s.get("title", "") or s.get("url", "")}
+        for s in sources
+    ]
+    processed_sources = _process_sources(raw_sources)[:5]
     return {
         "mode": "research",
         "verdict": verdict,
         "explanation": explanation,
         "content": content,
-        "sources": [
-            {
-                "url": s.get("url", ""),
-                "title": s.get("title", "") or s.get("url", ""),
-            }
-            for s in sources[:5]
-        ],
+        "sources": processed_sources,
+        "has_level0": any(s["level"] == 0 for s in processed_sources),
     }
 
 
 def call_mcp(claim: str) -> dict:
-    """Grounded verdict via the You.com MCP server (you-research tool).
-
-    The MCP HTTP endpoint is stateless here (no session id returned on
-    initialize), so a single tools/call request is enough. Responses come back
-    as JSON, but we also tolerate an SSE-framed body just in case.
-    """
+    """Grounded verdict via the You.com MCP server (you-research tool)."""
     body = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -134,12 +240,15 @@ def call_mcp(claim: str) -> dict:
         raise RuntimeError(content or "MCP tool returned an error")
 
     verdict, explanation = _parse_verdict(content)
+    raw_sources = _sources_from_markdown(content)
+    processed_sources = _process_sources(raw_sources)[:5]
     return {
         "mode": "mcp",
         "verdict": verdict,
         "explanation": explanation,
         "content": content,
-        "sources": _sources_from_markdown(content),
+        "sources": processed_sources,
+        "has_level0": any(s["level"] == 0 for s in processed_sources),
     }
 
 
@@ -189,24 +298,26 @@ def call_search(claim: str) -> dict:
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
-    # Search API shape: {"results": {"web": [...]}}; fall back to older shapes.
     block = data.get("results", data)
     results = block.get("web", []) if isinstance(block, dict) else []
     if not results:
         results = data.get("web", []) or []
     snippets = []
-    sources = []
+    raw_sources = []
     for r in results[:5]:
-        sources.append({"url": r.get("url", ""), "title": r.get("title", "") or r.get("url", "")})
+        raw_sources.append({"url": r.get("url", ""), "title": r.get("title", "") or r.get("url", "")})
         snips = r.get("snippets") or ([r["description"]] if r.get("description") else [])
         snippets.extend(snips[:1])
+    processed_sources = _process_sources(raw_sources)[:5]
     return {
         "mode": "search",
         "verdict": "UNVERIFIED",
         "explanation": " ".join(snippets[:2])[:280] or "See sources below.",
         "content": "\n".join(f"- {s}" for s in snippets),
-        "sources": sources,
+        "sources": processed_sources,
+        "has_level0": any(s["level"] == 0 for s in processed_sources),
     }
+
 
 
 def _parse_verdict(content: str):
