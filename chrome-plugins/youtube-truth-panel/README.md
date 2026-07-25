@@ -88,9 +88,9 @@ batch of checks settles, and whenever you click it. Its tooltip adds how many
 calls this backend run actually billed versus how many were served from cache.
 It turns amber below $5 and red at zero.
 
-## Depth modes
+## API modes
 
-Two You.com integrations, switchable in the panel:
+Two You.com integrations, switchable in the panel (the `REST` / `MCP` toggle):
 
 - **REST** → `POST https://api.you.com/v1/research` — grounded, cited verdict.
   The backend prompts it to lead with `VERDICT: TRUE|FALSE|MISLEADING|UNVERIFIED`,
