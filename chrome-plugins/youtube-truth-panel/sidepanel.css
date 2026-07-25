@@ -217,12 +217,31 @@ select {
 
 .claim { font-size: 12.5px; font-weight: 500; line-height: 1.45; margin-bottom: 7px; }
 .explain { color: #cdd3e0; font-size: 12px; margin-bottom: 8px; }
-.sources { display: flex; flex-direction: column; gap: 3px; }
+.sources { display: flex; flex-direction: column; gap: 4px; }
+.source { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
 .sources a {
   color: var(--accent); text-decoration: none; font-size: 11px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
 }
 .sources a:hover { text-decoration: underline; }
+
+/* Trust levels — see SOURCE_TRUST.md */
+.lvl {
+  flex: none; font-size: 9px; font-weight: 800; letter-spacing: .04em;
+  padding: 1px 5px; border-radius: 5px; border: 1px solid transparent;
+  font-variant-numeric: tabular-nums; cursor: help;
+}
+.lvl0 { color: var(--true); background: rgba(47,191,113,.15); }
+.lvl1 { color: var(--accent); background: rgba(108,140,255,.15); }
+.lvl2 { color: var(--muted); background: rgba(139,147,167,.15); }
+.lvl3 { color: var(--misleading); background: rgba(255,176,46,.15); }
+.lvl4 { color: var(--false); background: rgba(255,77,94,.17); }
+.lvl.unrated { border-style: dashed; border-color: currentColor; opacity: .75; }
+
+.trust-note {
+  font-size: 11px; color: var(--misleading); margin-bottom: 8px;
+  background: rgba(255,176,46,.08); border-radius: 6px; padding: 5px 7px;
+}
 
 .spinner {
   width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--accent);

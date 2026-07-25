@@ -49,8 +49,16 @@ FACTCHECK_PROMPT = (
     "be missing punctuation or contain small transcription errors — judge the "
     "substance, not the wording. Base the verdict only on reliable sources. Use "
     "UNVERIFIED when the statement is opinion, prediction, or not checkable.\n\n"
+    "Rank your evidence using this trust hierarchy:\n"
+    "  Level 0 (.edu, .gov, peer-reviewed science, WHO/CDC/NASA) — absolute truth\n"
+    "  Level 1 (Reuters, AP, BBC, WSJ, Pew, World Bank) — high trust\n"
+    "  Level 2 (industry and tech media, corporate newsrooms) — moderate trust\n"
+    "  Level 3/4 (social media, blogs, tabloids, conspiracy sites) — do not weight highly\n"
+    "A Level 0 source that directly settles a quantitative claim overrides lower "
+    "levels. Never rest a TRUE or FALSE verdict on Level 3/4 sources alone.\n\n"
     "Answer in exactly two lines and nothing else:\n"
-    "Line 1: 'VERDICT: X' where X is one of TRUE, FALSE, MISLEADING, UNVERIFIED.\n"
+    "Line 1: 'VERDICT: X (Trust Level: N)' where X is one of TRUE, FALSE, "
+    "MISLEADING, UNVERIFIED and N is 0-4 for the best evidence you actually used.\n"
     "Line 2: one plain-English sentence of at most 30 words explaining why.\n\n"
     "Formatting rules for line 2, follow them strictly:\n"
     "- Plain prose only. No markdown, no headings, no '#' characters, no bullet "
@@ -72,6 +80,120 @@ EXTRACT_PROMPT = (
     '{{"claim": "<the claim as a clean sentence>", "start": <seconds as a number>}}.'
     "\n\nVideo title: {title}\n\nTranscript:\n{transcript}"
 )
+
+# --------------------------------------------------- source trust classification
+# See SOURCE_TRUST.md. Short, editable starting lists — not a complete registry.
+
+LEVEL_NAMES = {
+    0: "Institutional / peer-reviewed",
+    1: "Major journalism & wire services",
+    2: "Secondary / industry media",
+    3: "User-generated / opinion",
+    4: "High-bias / low-reliability",
+}
+
+# Anything unmatched lands here, flagged as unrated so a default is never
+# mistaken for a vetted classification.
+DEFAULT_LEVEL = 2
+
+TRUST_TLDS = {
+    ".gov": 0, ".edu": 0, ".mil": 0, ".int": 0,
+    ".gov.uk": 0, ".ac.uk": 0, ".edu.au": 0, ".ac.jp": 0, ".gov.au": 0,
+}
+
+TRUST_DOMAINS = {
+    # Level 0 — institutional, peer-reviewed, primary
+    "pubmed.ncbi.nlm.nih.gov": 0, "ncbi.nlm.nih.gov": 0, "nature.com": 0,
+    "science.org": 0, "sciencedirect.com": 0, "arxiv.org": 0, "jstor.org": 0,
+    "ieee.org": 0, "ieeexplore.ieee.org": 0, "thelancet.com": 0, "nejm.org": 0,
+    "bmj.com": 0, "cell.com": 0, "pnas.org": 0, "springer.com": 0,
+    "who.int": 0, "un.org": 0, "europa.eu": 0, "esa.int": 0,
+    # Level 1 — wire services, major outlets, statistical repositories
+    "reuters.com": 1, "apnews.com": 1, "ap.org": 1, "afp.com": 1,
+    "bbc.com": 1, "bbc.co.uk": 1, "wsj.com": 1, "ft.com": 1,
+    "economist.com": 1, "npr.org": 1, "pbs.org": 1, "bloomberg.com": 1,
+    "nytimes.com": 1, "washingtonpost.com": 1, "theguardian.com": 1,
+    "worldbank.org": 1, "oecd.org": 1, "imf.org": 1, "pewresearch.org": 1,
+    "ourworldindata.org": 1, "britannica.com": 1,
+    # Level 2 — secondary, industry, corporate newsrooms
+    "techcrunch.com": 2, "wired.com": 2, "cnbc.com": 2, "forbes.com": 2,
+    "theverge.com": 2, "arstechnica.com": 2, "engadget.com": 2,
+    "businessinsider.com": 2, "espn.com": 2, "theathletic.com": 2,
+    "rollingstone.com": 2, "cnn.com": 2, "nbcnews.com": 2, "cbsnews.com": 2,
+    "time.com": 2, "newsweek.com": 2, "snopes.com": 2, "politifact.com": 2,
+    "factcheck.org": 2, "apple.com": 2, "blog.google": 2, "microsoft.com": 2,
+    # Level 3 — user-generated, self-published, social
+    "reddit.com": 3, "medium.com": 3, "substack.com": 3, "quora.com": 3,
+    "x.com": 3, "twitter.com": 3, "facebook.com": 3, "instagram.com": 3,
+    "tiktok.com": 3, "linkedin.com": 3, "youtube.com": 3, "wikipedia.org": 3,
+    "blogspot.com": 3, "wordpress.com": 3, "tumblr.com": 3, "stackexchange.com": 3,
+    # Level 4 — tabloid, conspiracy, state propaganda, clickbait
+    "dailymail.co.uk": 4, "nationalenquirer.com": 4, "thesun.co.uk": 4,
+    "mirror.co.uk": 4, "infowars.com": 4, "naturalnews.com": 4,
+    "beforeitsnews.com": 4, "thegatewaypundit.com": 4, "newspunch.com": 4,
+    "rt.com": 4, "sputniknews.com": 4, "presstv.ir": 4,
+}
+
+
+def classify_source(url: str):
+    """Map a citation URL to a trust level. Returns (level, rated)."""
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower().strip(".")
+    except ValueError:
+        return DEFAULT_LEVEL, False
+    if not host:
+        return DEFAULT_LEVEL, False
+    if host.startswith("www."):
+        host = host[4:]
+
+    # Explicit domains win over TLD rules (e.g. dailymail.co.uk before .uk).
+    for domain, level in TRUST_DOMAINS.items():
+        if host == domain or host.endswith("." + domain):
+            return level, True
+    for tld, level in TRUST_TLDS.items():
+        if host.endswith(tld):
+            return level, True
+    return DEFAULT_LEVEL, False
+
+
+def rate_sources(sources: list) -> list:
+    """Attach a trust level to every source and order them best-first."""
+    rated = []
+    for s in sources:
+        url = s.get("url", "")
+        if not url:
+            continue
+        level, known = classify_source(url)
+        rated.append(
+            {
+                "url": url,
+                "title": s.get("title") or url,
+                "level": level,
+                "level_name": LEVEL_NAMES.get(level, "Unclassified"),
+                "rated": known,
+            }
+        )
+    rated.sort(key=lambda s: s["level"])
+    return rated
+
+
+def _apply_trust_rules(verdict: str, sources: list):
+    """Enforce the SOURCE_TRUST.md rules that outrank the model's own call."""
+    levels = [s["level"] for s in sources]
+    if not levels:
+        return verdict, None
+
+    best = min(levels)
+    if verdict in ("TRUE", "FALSE"):
+        if best >= 4:
+            return "UNVERIFIED", "Only Level 4 (high-bias / low-reliability) sources — verdict withheld."
+        if best >= 3:
+            return "UNVERIFIED", "Only Level 3 (user-generated) sources — not a basis for a factual verdict."
+        if best == 1 and sum(1 for x in levels if x <= 1) < 2:
+            # Noted rather than downgraded — see the caveat in SOURCE_TRUST.md.
+            return verdict, "Single Level 1 citation, below the 2-source minimum."
+    return verdict, None
+
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -104,17 +226,21 @@ def call_research(claim: str, context: str = "") -> dict:
     data = _research(FACTCHECK_PROMPT.format(claim=claim, context=context))
     output = data.get("output", {}) or {}
     content = output.get("content", "") or ""
-    sources = output.get("sources", []) or []
-    verdict, explanation = _parse_verdict(content)
+    raw_sources = output.get("sources", []) or []
+    verdict, explanation, model_level = _parse_verdict(content)
+    sources = rate_sources(
+        [{"url": s.get("url", ""), "title": s.get("title", "")} for s in raw_sources]
+    )[:5]
+    verdict, trust_note = _apply_trust_rules(verdict, sources)
     return {
         "mode": "research",
         "verdict": verdict,
         "explanation": explanation,
         "content": content,
-        "sources": [
-            {"url": s.get("url", ""), "title": s.get("title", "") or s.get("url", "")}
-            for s in sources[:5]
-        ],
+        "sources": sources,
+        "trust_note": trust_note,
+        "best_level": sources[0]["level"] if sources else None,
+        "model_trust_level": model_level,
     }
 
 
@@ -163,13 +289,18 @@ def call_mcp(claim: str, context: str = "") -> dict:
     if result.get("isError"):
         raise RuntimeError(content or "MCP tool returned an error")
 
-    verdict, explanation = _parse_verdict(content)
+    verdict, explanation, model_level = _parse_verdict(content)
+    sources = rate_sources(_sources_from_markdown(content))[:5]
+    verdict, trust_note = _apply_trust_rules(verdict, sources)
     return {
         "mode": "mcp",
         "verdict": verdict,
         "explanation": explanation,
         "content": content,
-        "sources": _sources_from_markdown(content),
+        "sources": sources,
+        "trust_note": trust_note,
+        "best_level": sources[0]["level"] if sources else None,
+        "model_trust_level": model_level,
     }
 
 
@@ -266,8 +397,13 @@ def _clean_explanation(raw: str, limit: int = 300) -> str:
 
 
 def _parse_verdict(content: str):
-    """Pull the leading 'VERDICT: X' line out of the model's answer."""
+    """Pull 'VERDICT: X (Trust Level: N)' out of the model's answer.
+
+    Returns (verdict, explanation, model_trust_level). The trust level is what
+    the model claims it used; the server classifies the citations itself.
+    """
     verdict = "UNVERIFIED"
+    model_level = None
     explanation = content.strip()
     for line in content.splitlines():
         line = line.strip()
@@ -280,11 +416,14 @@ def _parse_verdict(content: str):
                 if cand in upper:
                     verdict = cand
                     break
+            m = re.search(r"TRUST\s*LEVEL\s*[:=]?\s*\[?\s*([0-4])", upper)
+            if m:
+                model_level = int(m.group(1))
             # Everything after the verdict line becomes the explanation.
             rest = content.split(line, 1)[-1].strip()
             explanation = rest or explanation
             break
-    return verdict, _clean_explanation(explanation)
+    return verdict, _clean_explanation(explanation), model_level
 
 
 def _parse_jsonrpc(raw: str) -> dict:
